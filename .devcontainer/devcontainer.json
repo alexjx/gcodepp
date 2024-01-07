@@ -13,7 +13,7 @@
   },
   "initializeCommand": "bash .devcontainer/initialize.sh",
   "mounts": [
-    "source=${localEnv:HOME}/.gitconfig,target=${localEnv:HOME}/.gitconfig,type=bind",
+    "source=${localEnv:HOME}/.gitconfig-private,target=${localEnv:HOME}/.gitconfig,type=bind",
     "source=gcodeproc_go,target=/go,type=volume",
     "source=gcodeproc_vscode,target=${localEnv:HOME}/.vscode-server,type=volume",
   ],
