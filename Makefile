@@ -1,7 +1,15 @@
 .PHONY: all build compile clean
 
+
+BUILDTIME ?= $(shell date +%Y-%m-%d_%I:%M:%S)
+GITCOMMIT ?= $(shell git rev-parse HEAD)
+BUILDNUMER ?= $(shell git rev-list --count HEAD)
+
 LDFLAGS = -extldflags \
-          -static
+          -static \
+          -X "main.BuiltAt=$(BUILDTIME)" \
+          -X "main.GitHash=$(GITCOMMIT)" \
+          -X "main.BuildNumber=$(BUILDNUMER)"
 
 all: build
 
