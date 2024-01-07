@@ -1,0 +1,55 @@
+version: '3.8'
+
+networks:
+  cmdb-devcontainer:
+    driver: bridge
+
+services:
+  devcontainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - USERNAME=${USER}
+    image: &imagename vscode-devcontainer-cmdb
+    container_name: cmdb-devcontainer
+    cap_add:
+      - ALL
+    privileged: true
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      - GOPROXY=https://goproxy.cn
+      - GOPRIVATE=git.fastonetech.com
+    command:
+      - bash
+      - -c
+      - while true; do sleep infinity; done
+    volumes:
+      - ..:/wkspace
+    ulimits:
+      core: -1
+    network_mode: host
+    # networks:
+    #   - cmdb-devcontainer
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+    # ports:
+    #   - 28080:8080
+    #   - 28081:8081
+    depends_on:
+      - database
+
+  database:
+    image: hub.fastonetech.com/infra/postgres:12-alpine
+    container_name: cmdb-database
+    networks:
+      - cmdb-devcontainer
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=cmdb
+    volumes:
+      - ./database:/var/lib/postgresql/data
+    ports:
+      - 5435:5432

@@ -1,0 +1,35 @@
+{
+  "name": "gcodeproc",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "USERNAME": "${localEnv:USER}"
+    }
+  },
+  "forwardPorts": [],
+  "containerEnv": {
+    "GOPROXY": "https://goproxy.cn",
+    "GOPRIVATE": "git.fastonetech.com"
+  },
+  "initializeCommand": "bash .devcontainer/initialize.sh",
+  "mounts": [
+    "source=${localEnv:HOME}/.gitconfig,target=${localEnv:HOME}/.gitconfig,type=bind",
+    "source=gcodeproc_go,target=/go,type=volume",
+    "source=gcodeproc_vscode,target=${localEnv:HOME}/.vscode-server,type=volume",
+  ],
+  "runArgs": [
+    "--network",
+    "host"
+  ],
+  "containerUser": "${localEnv:USER}",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "EditorConfig.EditorConfig",
+        "aldijav.golangwithdidi",
+        "ms-vscode.makefile-tools"
+      ],
+      "settings": {}
+    }
+  }
+}
