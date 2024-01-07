@@ -54,19 +54,30 @@ gcodepp.exe preheat --config config.yaml <input file>
 Config file example:
 
 ```yaml
+costs:
+  toolchange: 10 # seconds, time to change tool
+  retraction: 0.02 # seconds, time to retract/unretract filament
 extruders:
 - name: T0
-  heat_up: 180
-  active_gcode: SET_TOOL_TEMPERATURE TOOL=0 CHNG_STATE=2
+  heat_up: 90
+  active_gcode: |-
+    RESPOND PREFIX="preheat" MSG="preheating tool 0"
+    SET_TOOL_TEMPERATURE TOOL=0 CHNG_STATE=2
 - name: T1
-  heat_up: 180
-  active_gcode: SET_TOOL_TEMPERATURE TOOL=1 CHNG_STATE=2
+  heat_up: 90
+  active_gcode: |-
+    RESPOND PREFIX="preheat" MSG="preheating tool 1"
+    SET_TOOL_TEMPERATURE TOOL=1 CHNG_STATE=2
 - name: T2
-  heat_up: 180
-  active_gcode: SET_TOOL_TEMPERATURE TOOL=2 CHNG_STATE=2
+  heat_up: 90
+  active_gcode: |-
+    RESPOND PREFIX="preheat" MSG="preheating tool 2"
+    SET_TOOL_TEMPERATURE TOOL=2 CHNG_STATE=2
 - name: T3
-  heat_up: 180
-  active_gcode: SET_TOOL_TEMPERATURE TOOL=3 CHNG_STATE=2
+  heat_up: 90
+  active_gcode: |-
+    RESPOND PREFIX="preheat" MSG="preheating tool 3"
+    SET_TOOL_TEMPERATURE TOOL=3 CHNG_STATE=2
 ```
 
 Each extruder has the following properties:
@@ -74,3 +85,9 @@ Each extruder has the following properties:
 - `name`: the name of the extruder (This matches the tool change gcode)
 - `heat_up`: the time (in seconds) needs to heat up the extruder
 - `active_gcode`: the gcode to activate the extruder
+- `deactive_gcode`: the gcode to deactivate the extruder (optional)
+
+There is also a `costs` section with the following properties:
+
+- `toolchange`: the time (in seconds) to change the tool
+- `retraction`: the time (in seconds) to retract/unretract the filament

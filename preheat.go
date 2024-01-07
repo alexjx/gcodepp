@@ -19,6 +19,11 @@ type Extruder struct {
 	HeatUp          float64 `yaml:"heat_up"`
 	ActiveGcode     string  `yaml:"active_gcode"`
 	DeactivateGcode string  `yaml:"deactivate_gcode"`
+
+	// internal state
+	preheatedTime    float64 // time when this extruder is preheated
+	preheatedForTime float64 // time when this extruder is preheated for
+	deactivatedTime  float64 // time when this extruder is deactivated
 }
 
 type GcodeCost struct {
@@ -30,8 +35,9 @@ type PreheatConfig struct {
 	Extruders []*Extruder `yaml:"extruders"`
 	Costs     *GcodeCost  `yaml:"costs"`
 
-	noRename  bool
-	timestamp bool
+	speedChangeRatio float64
+	noRename         bool
+	timestamp        bool
 }
 
 type ExtruderState struct {
@@ -77,10 +83,11 @@ type PreheatState struct {
 	MaxHeatUp float64
 
 	// state tracking
-	State *ExtruderState
+	State   *ExtruderState
+	Current *Extruder
 
 	// gcode tracking
-	PrintTime float64 // total print time
+	PrintTime float64 // print time of all processed gcodes
 
 	GcodesTime float64 // current queued print time
 	Gcodes     *GcodeQueue
@@ -297,6 +304,11 @@ var preheatCmd = &cli.Command{
 			Name:  "log",
 			Usage: "log file",
 		},
+		&cli.Float64Flag{
+			Name:  "speed-change-ratio",
+			Usage: "ratio of time in speed change phase of each move",
+			Value: 0.4,
+		},
 
 		// debug flags
 		&cli.BoolFlag{
@@ -354,6 +366,7 @@ var preheatCmd = &cli.Command{
 			return err
 		}
 
+		cfg.speedChangeRatio = cctx.Float64("speed-change-ratio")
 		cfg.noRename = cctx.Bool("no-rename")
 		cfg.timestamp = cctx.Bool("timestamp")
 
@@ -417,12 +430,17 @@ func Preheat(gcodePath string, cfg *PreheatConfig) error {
 			} else if g.IsMove() {
 				// calculate time for move gcodes
 				d := g.Distance(state.State)
+
+				// FIXME: this is not accurate
+				// we should consider the acceleration and deceleration time
+				// let's first be rough: 30% of the time is acceleration and deceleration
 				if g.F.Valid {
 					g.Time = d / g.F.Value
 					state.State.Feedrate = g.F.Value
 				} else if state.State.Feedrate > 0 {
 					g.Time = d / state.State.Feedrate
 				}
+				g.Time += g.Time * cfg.speedChangeRatio
 
 				state.State.Update(g)
 			}
@@ -437,7 +455,7 @@ func Preheat(gcodePath string, cfg *PreheatConfig) error {
 			}
 		}
 
-		// this is essential
+		// this is essential:
 		// by trying to encode each gcode with the print time
 		// we establish an order of gcodes which we could compare
 		// if a gcode is within a certain time of the head of the queue
@@ -455,25 +473,27 @@ func Preheat(gcodePath string, cfg *PreheatConfig) error {
 				// see if we to expire an entry
 				shouldFlush := func() bool {
 					// if we have long enough gcodes in the queue
-					frontG := state.Gcodes.Front()
-					if (state.GcodesTime - frontG.Time) > state.MaxHeatUp {
+					frontCode := state.Gcodes.Front()
+					if (state.GcodesTime - frontCode.Time) > state.MaxHeatUp {
 						return true
 					}
+					// always flush for the prolog of the file
 					if state.ToolchangeCount == 0 {
 						return true
 					}
 					return false
 				}
+
 				for state.Gcodes.Len() > 1 && shouldFlush() {
 					var (
 						frontCode = state.Gcodes.Front()
 						timestamp string
 					)
 
-					if cfg.timestamp && g.IsMove() {
+					if cfg.timestamp && frontCode.IsMove() {
 						timestamp = fmt.Sprintf("  ; printTime=%.2f", frontCode.PrintTime)
 					}
-					outputFp.WriteString(g.Line + timestamp + "\n")
+					outputFp.WriteString(frontCode.Line + timestamp + "\n")
 
 					state.GcodesTime -= frontCode.Time
 					state.Gcodes.Pop()
@@ -482,14 +502,42 @@ func Preheat(gcodePath string, cfg *PreheatConfig) error {
 			}
 
 			// this is a toolchange code
+			// we need to do two things:
+			// 1. insert a preheat gcode at the head of the queue for this tool
+			// 2. consider if we need to deactivate the previous tool, at the tail of the queue
+			//    but this is not optimal. Since we might problem to deactivate a tool that is preheated earlier
+			//    ----pA-pB---pA--a-b-a
+			//                      ^ if we deactivated a here. the previous pA is useless
+			//    so we can deactivate a tool only if it is not preheated in the future queue...
 			extruder := state.Extruders[g.Op]
+			currentExtruder := state.Current
 			if state.ToolchangeCount > 0 { // avoid inserting active gcode at the start of the file
 				// we have a tool change, we insert an tool active gcode at current queue head
 				frontCode := state.Gcodes.Front()
-				preheatGcode := fmt.Sprintf("; PREHEAT %s %.1fs early @ %.2f\n%s\n", extruder.Name, state.GcodesTime, frontCode.PrintTime, extruder.ActiveGcode)
-				outputFp.WriteString(preheatGcode)
+
+				// do not preheat the tool if it has not yet been deactivated
+				if extruder.preheatedTime == 0.0 || (extruder.deactivatedTime > 0.0 && extruder.preheatedTime > extruder.deactivatedTime) {
+					preheatGcode := fmt.Sprintf("; PREHEAT %s %.1fs early @ %.2f\n%s\n", extruder.Name, state.GcodesTime, frontCode.PrintTime, extruder.ActiveGcode)
+					outputFp.WriteString(preheatGcode)
+					extruder.preheatedTime = frontCode.PrintTime // this is the time when this extruder is preheated
+					extruder.preheatedForTime = g.PrintTime      // this is the time when this extruder is preheated for
+				}
+
+				if currentExtruder != nil {
+					// check if we should deactivate the current tool
+					// we should only deactivate if the current tool is not preheated
+					if currentExtruder.preheatedForTime < frontCode.PrintTime {
+						currentExtruder.deactivatedTime = frontCode.PrintTime
+
+						if currentExtruder.DeactivateGcode != "" {
+							deactivateGcode := fmt.Sprintf("; DEACTIVATE %s @ %.2f\n%s\n", currentExtruder.Name, frontCode.PrintTime, currentExtruder.DeactivateGcode)
+							outputFp.WriteString(deactivateGcode)
+						}
+					}
+				}
 			}
 			state.ToolchangeCount++
+			state.Current = extruder
 		}
 	}
 
