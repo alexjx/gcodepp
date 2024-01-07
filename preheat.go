@@ -387,7 +387,8 @@ func Preheat(gcodePath string, cfg *PreheatConfig) error {
 		Gcodes:    &GcodeQueue{q: queue.New()},
 	}
 	for _, extruder := range cfg.Extruders {
-		state.Extruders[extruder.Name] = extruder
+		normlizedName := strings.ToUpper(extruder.Name)
+		state.Extruders[normlizedName] = extruder
 		if extruder.HeatUp > state.MaxHeatUp {
 			state.MaxHeatUp = extruder.HeatUp
 		}
