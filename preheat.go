@@ -129,6 +129,8 @@ type Gcode struct {
 
 	S NullableFloat64
 	F NullableFloat64
+	P NullableFloat64
+	R NullableFloat64
 
 	Comment string
 }
@@ -255,7 +257,17 @@ func ParseGcode(line string, lineNo int64) (g *Gcode) {
 		case "F", "f":
 			g.F.Value = param / 60.0 // convert to mm/s
 			g.F.Valid = true
+		case "S", "s":
+			g.S.Value = param
+			g.S.Valid = true
+		case "P", "p":
+			g.P.Value = param
+			g.P.Valid = true
+		case "R", "r":
+			g.R.Value = param
+			g.R.Valid = true
 		default:
+			logrus.Debugf("line: %s", line)
 			logrus.Debugf("unknown prefix: %s", prefix)
 			return
 		}
@@ -420,6 +432,66 @@ func Preheat(gcodePath string, cfg *PreheatConfig) error {
 	scanner := bufio.NewScanner(gcodeFp)
 	lineNo := int64(0)
 	for scanner.Scan() {
+		// output processed gcodes
+		// see if we to expire an entry
+		shouldFlush := func() bool {
+			// if we have long enough gcodes in the queue
+			frontCode := state.Gcodes.Front()
+			if (state.GcodesTime - frontCode.Time) > state.MaxHeatUp {
+				return true
+			}
+			// always flush for the prolog of the file
+			if state.ToolchangeCount == 0 {
+				return true
+			}
+			return false
+		}
+
+		for state.Gcodes.Len() > 1 && shouldFlush() {
+			var (
+				frontCode    = state.Gcodes.Front()
+				debugComment string
+			)
+
+			// see if we should cancel the deactivate code
+			if frontCode.DeactivateCode {
+				extr := frontCode.Extruder
+				// if there is a preheat for this extruder in the last
+				// and it's for a time after the current gcode
+				if extr.preheatedTime < frontCode.PrintTime && extr.preheatedForTime > frontCode.PrintTime {
+					logrus.Debugf("cancel deactivate %s @ %.1f: preheatedTime=%.1f preheatedFor=%.1f",
+						extr.Name, frontCode.PrintTime, extr.preheatedTime, extr.preheatedForTime)
+					// this deactivate code should be cancelled
+					state.Gcodes.Pop()
+					continue
+				}
+				// this deactivate code should be executed
+				extr.deactivatedTime = frontCode.PrintTime
+			}
+
+			if cfg.debug {
+				if frontCode.IsMove() || frontCode.ToolchangeCode {
+					debugComment = fmt.Sprintf("  ; printTime=%.1f", frontCode.PrintTime)
+				}
+				if frontCode.ToolchangeCode {
+					// include if there is a pending preheat
+					// - previous extruder has preheat time before current
+					// - previous extruder has preheat for time after current
+					if prevExtruder := frontCode.PrevExtr; prevExtruder != nil {
+						debugComment += " prev=" + prevExtruder.Name
+						if prevExtruder.preheatedTime < frontCode.PrintTime && prevExtruder.preheatedForTime > frontCode.PrintTime {
+							debugComment += fmt.Sprintf(" preheating [%1.f -> %.1f]", prevExtruder.preheatedTime, prevExtruder.preheatedForTime)
+						}
+					}
+				}
+			}
+			outputFp.WriteString(frontCode.Line + debugComment + "\n")
+
+			state.GcodesTime -= frontCode.Time
+			state.Gcodes.Pop()
+		}
+
+		// parse gcode
 		line := scanner.Text()
 		lineNo++
 
@@ -481,62 +553,6 @@ func Preheat(gcodePath string, cfg *PreheatConfig) error {
 			// for none toolchange codes, it triggers a queue maintenance phase
 			if !g.ToolchangeCode {
 				g.Extruder = state.Current
-
-				// see if we to expire an entry
-				shouldFlush := func() bool {
-					// if we have long enough gcodes in the queue
-					frontCode := state.Gcodes.Front()
-					if (state.GcodesTime - frontCode.Time) > state.MaxHeatUp {
-						return true
-					}
-					// always flush for the prolog of the file
-					if state.ToolchangeCount == 0 {
-						return true
-					}
-					return false
-				}
-
-				for state.Gcodes.Len() > 1 && shouldFlush() {
-					var (
-						frontCode    = state.Gcodes.Front()
-						debugComment string
-					)
-
-					// see if we should cancel the deactivate code
-					if frontCode.DeactivateCode {
-						extr := frontCode.Extruder
-						// if there is a preheat for this extruder in the last
-						// and it's for a time after the current gcode
-						if extr.preheatedTime < frontCode.PrintTime && extr.preheatedForTime > frontCode.PrintTime {
-							// this deactivate code should be cancelled
-							state.Gcodes.Pop()
-							continue
-						}
-						// this deactivate code should be executed
-						extr.deactivatedTime = frontCode.PrintTime
-					}
-
-					if cfg.debug {
-						if frontCode.IsMove() || frontCode.ToolchangeCode {
-							debugComment = fmt.Sprintf("  ; printTime=%.2f", frontCode.PrintTime)
-						}
-						if frontCode.ToolchangeCode {
-							// include if there is a pending preheat
-							// - previous extruder has preheat time before current
-							// - previous extruder has preheat for time after current
-							if prevExtruder := frontCode.PrevExtr; prevExtruder != nil {
-								debugComment += " prev=" + prevExtruder.Name
-								if prevExtruder.preheatedTime < frontCode.PrintTime && prevExtruder.preheatedForTime > frontCode.PrintTime {
-									debugComment += fmt.Sprintf(" preheating %s for %.2f", prevExtruder.Name, prevExtruder.preheatedForTime)
-								}
-							}
-						}
-					}
-					outputFp.WriteString(frontCode.Line + debugComment + "\n")
-
-					state.GcodesTime -= frontCode.Time
-					state.Gcodes.Pop()
-				}
 				continue
 			}
 
@@ -549,47 +565,50 @@ func Preheat(gcodePath string, cfg *PreheatConfig) error {
 			//                      ^ if we deactivated a here. the previous pA is useless
 			//    so we can deactivate a tool only if it is not preheated in the future queue...
 			extruder := state.Extruders[g.Op]
-			currentExtruder := state.Current
+			curExtr := state.Current
 			if state.ToolchangeCount > 0 { // avoid inserting active gcode at the start of the file
 				// we have a tool change, we insert an tool active gcode at current queue head
 				qHeadCode := state.Gcodes.Front()
 
 				// do not preheat the tool if it has not yet been deactivated
 				if extruder.preheatedTime < 0.0 || (extruder.deactivatedTime > 0.0 && extruder.preheatedTime < extruder.deactivatedTime) {
-					preheatGcode := fmt.Sprintf("; PREHEAT %s %.1fs early @ %.2f for %.2f (last preheat %.2f / deactive %.2f) \n%s\n",
-						extruder.Name, state.GcodesTime, qHeadCode.PrintTime,
-						g.PrintTime, extruder.preheatedTime, extruder.deactivatedTime,
+					preheatGcode := fmt.Sprintf("; PREHEAT %s [%.1f -> %.1f] (last %.1f / deactive %.1f) \n%s\n",
+						extruder.Name, qHeadCode.PrintTime, g.PrintTime,
+						extruder.preheatedTime, extruder.deactivatedTime,
 						extruder.ActiveGcode,
 					)
 					outputFp.WriteString(preheatGcode)
 					extruder.preheatedTime = qHeadCode.PrintTime // this is the time when this extruder is preheated
-					extruder.preheatedForTime = g.PrintTime      // this is the time when this extruder is preheated for
+				} else {
+					logrus.Debugf("skip preheat for %s @ %.1f: [%.1f -> %.1f] / %.1f",
+						extruder.Name, g.PrintTime, extruder.preheatedTime, extruder.preheatedForTime, extruder.deactivatedTime)
 				}
+				extruder.preheatedForTime = g.PrintTime
 
 				// check if we should deactivate the current tool
 				// we should only deactivate if the current tool is not preheated
 				// NOTE: this is only queued, it might be cancelled when we flush the queue
-				if currentExtruder != nil && currentExtruder.DeactivateGcode != "" {
-					deactivateGcode := fmt.Sprintf("; DEACTIVATE %s @ %.2f (preheat for %.2f / qhead %2.f)\n%s\n",
-						currentExtruder.Name, g.PrintTime,
-						currentExtruder.preheatedForTime, qHeadCode.PrintTime,
-						currentExtruder.DeactivateGcode)
+				if curExtr != nil && curExtr.DeactivateGcode != "" {
+					logrus.Debugf("queue deactivate %s @ %.1f", curExtr.Name, g.PrintTime)
+					deactivateGcode := fmt.Sprintf("; DEACTIVATE %s @ %.1f\n%s\n",
+						curExtr.Name, g.PrintTime, curExtr.DeactivateGcode)
 					// we need to enqueue this gcode
 					code := Gcode{
 						Line:           deactivateGcode,
 						LineNo:         g.LineNo, // duplicate line number
 						DeactivateCode: true,
-						Extruder:       currentExtruder,
+						Extruder:       curExtr,
+						PrintTime:      g.PrintTime,
 					}
-					code.PrintTime = g.PrintTime
 					state.Gcodes.Push(&code)
 				}
 			}
 
 			state.ToolchangeCount++
 			state.Current = extruder
+
 			g.Extruder = extruder
-			g.PrevExtr = currentExtruder
+			g.PrevExtr = curExtr
 		}
 	}
 

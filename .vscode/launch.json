@@ -16,7 +16,7 @@
                 "--log", "${workspaceFolder}/tmp/preheat.log",
                 "--no-rename",
                 "--debug",
-                "${workspaceFolder}/tmp/Cali-Dragon_v1_repaired_Klipper_TC_20240106-222359.gcode"
+                "${workspaceFolder}/tmp/Cali-Dragon_v1_repaired_Klipper_TC_zhop_20240107-134810.gcode"
             ]
         }
     ]
