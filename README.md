@@ -7,6 +7,11 @@ This is a post processor tool for 3D print slicers.
 - Substitutes
 - Preheat extruder in tool changer
 
+## TODO
+
+- [ ] Preheat support for G2/G3
+- [ ] Preheat support for G4
+
 ## Usage
 
 ### Substitutes
