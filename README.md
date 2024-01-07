@@ -49,6 +49,17 @@ substitutions:
 
 ### Preheat extruder in tool changer
 
+While using a tool changer, slicer other than CURA will generate toolchange command, and the temperature of the extruder is controlled by the firmware.
+There are excessive time used to wait for the extruder to heat up. This tool will insert preheat command before the toolchange command. It tracks the time
+used by each move gcode (not accurately, just rough estimation), and use insert a preheat command at specific time before the toolchange command.
+
+If there are multiple interleave toolchange commands, the deactivate command will not be inserted if the tool is still covered by a preheat phase.
+
+Note:
+
+- This tool assume there is not other control of the extruder temperature. For example, KTCC has a standby timeout, which turn off the extruder if it's idle for long enough. This will not know about this. However it's normally not catastrophic, as the extruder will be heated up again when the tool is activated.
+
+
 ```bash
 gcodepp.exe preheat --config config.yaml <input file>
 ```
