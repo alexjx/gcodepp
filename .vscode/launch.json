@@ -13,6 +13,7 @@
             "args": [
                 "preheat",
                 "--config", "${workspaceFolder}/tmp/preheat.yaml",
+                "--log", "${workspaceFolder}/tmp/preheat.log",
                 "--no-rename",
                 "--timestamp",
                 "${workspaceFolder}/tmp/Cali-Dragon_v1_repaired_Klipper_TC_20240106-222359.gcode"

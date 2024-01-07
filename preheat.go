@@ -8,20 +8,27 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/phf/go-queue/queue"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
 	"gopkg.in/yaml.v3"
 )
 
 type Extruder struct {
-	Name        string  `yaml:"name"`
-	HeatUp      float64 `yaml:"heat_up"`
-	ActiveGcode string  `yaml:"active_gcode"`
+	Name            string  `yaml:"name"`
+	HeatUp          float64 `yaml:"heat_up"`
+	ActiveGcode     string  `yaml:"active_gcode"`
+	DeactivateGcode string  `yaml:"deactivate_gcode"`
+}
+
+type GcodeCost struct {
+	Toolchange float64 `yaml:"toolchange"`
+	Retraction float64 `yaml:"retraction"`
 }
 
 type PreheatConfig struct {
-	Extruders      []*Extruder `yaml:"extruders"`
-	ToolChangeTime float64     `yaml:"toolchange_time"`
+	Extruders []*Extruder `yaml:"extruders"`
+	Costs     *GcodeCost  `yaml:"costs"`
 
 	noRename  bool
 	timestamp bool
@@ -72,9 +79,11 @@ type PreheatState struct {
 	// state tracking
 	State *ExtruderState
 
-	PrintTime  float64 // total print time
+	// gcode tracking
+	PrintTime float64 // total print time
+
 	GcodesTime float64 // current queued print time
-	Gcodes     []*Gcode
+	Gcodes     *GcodeQueue
 
 	ToolchangeCount int64
 }
@@ -87,10 +96,11 @@ type NullableFloat64 struct {
 type Gcode struct {
 	Parsed bool
 
-	Line      string  // original line
-	LineNo    int64   // line number
-	Time      float64 // for calculating print time
 	PrintTime float64 // cumulative time offset
+
+	Line   string  // original line
+	LineNo int64   // line number
+	Time   float64 // for calculating print time
 
 	ToolchangeCode bool // is this a toolchange code
 
@@ -186,7 +196,7 @@ func ParseGcode(line string, lineNo int64) (g *Gcode) {
 	}
 
 	// parse op
-	g.Op = parts[0]
+	g.Op = strings.ToUpper(parts[0])
 
 	// parse args
 	prefix := ""
@@ -210,28 +220,28 @@ func ParseGcode(line string, lineNo int64) (g *Gcode) {
 		}
 
 		switch prefix {
-		case "X":
+		case "X", "x":
 			g.X.Value = param
 			g.X.Valid = true
-		case "Y":
+		case "Y", "y":
 			g.Y.Value = param
 			g.Y.Valid = true
-		case "Z":
+		case "Z", "z":
 			g.Z.Value = param
 			g.Z.Valid = true
-		case "E":
+		case "E", "e":
 			g.E.Value = param
 			g.E.Valid = true
-		case "I":
+		case "I", "i":
 			g.I.Value = param
 			g.I.Valid = true
-		case "J":
+		case "J", "j":
 			g.J.Value = param
 			g.J.Valid = true
-		case "K":
+		case "K", "k":
 			g.K.Value = param
 			g.K.Valid = true
-		case "F":
+		case "F", "f":
 			g.F.Value = param / 60.0 // convert to mm/s
 			g.F.Valid = true
 		default:
@@ -244,6 +254,34 @@ func ParseGcode(line string, lineNo int64) (g *Gcode) {
 
 	g.Parsed = true
 	return
+}
+
+type GcodeQueue struct {
+	q *queue.Queue
+}
+
+func (q *GcodeQueue) Push(g *Gcode) {
+	q.q.PushBack(g)
+}
+
+func (q *GcodeQueue) Pop() *Gcode {
+	v := q.q.PopFront()
+	if v == nil {
+		return nil
+	}
+	return v.(*Gcode)
+}
+
+func (q *GcodeQueue) Len() int {
+	return q.q.Len()
+}
+
+func (q *GcodeQueue) Front() *Gcode {
+	v := q.q.Front()
+	if v == nil {
+		return nil
+	}
+	return v.(*Gcode)
 }
 
 var preheatCmd = &cli.Command{
@@ -294,6 +332,22 @@ var preheatCmd = &cli.Command{
 			return fmt.Errorf("failed to decode config file: %w", err)
 		}
 
+		// check configs
+		if len(cfg.Extruders) == 0 {
+			return fmt.Errorf("no extruders defined")
+		}
+		for _, extruder := range cfg.Extruders {
+			if extruder.Name == "" {
+				return fmt.Errorf("extruder name cannot be empty")
+			}
+			if extruder.ActiveGcode == "" {
+				return fmt.Errorf("extruder active gcode cannot be empty")
+			}
+			if extruder.HeatUp <= 0 {
+				return fmt.Errorf("extruder heat up time must be positive")
+			}
+		}
+
 		// setup logging
 		logfile := cctx.Path("log")
 		if err := setupLogging(logfile); err != nil {
@@ -317,6 +371,7 @@ func Preheat(gcodePath string, cfg *PreheatConfig) error {
 		Config:    cfg,
 		Extruders: make(map[string]*Extruder),
 		State:     &ExtruderState{},
+		Gcodes:    &GcodeQueue{q: queue.New()},
 	}
 	for _, extruder := range cfg.Extruders {
 		state.Extruders[extruder.Name] = extruder
@@ -355,6 +410,10 @@ func Preheat(gcodePath string, cfg *PreheatConfig) error {
 				state.State.RelPos = false
 			} else if g.Op == "G91" {
 				state.State.RelPos = true
+			} else if g.Op == "G10" || g.Op == "G11" {
+				if cfg.Costs != nil {
+					g.Time = cfg.Costs.Retraction
+				}
 			} else if g.IsMove() {
 				// calculate time for move gcodes
 				d := g.Distance(state.State)
@@ -367,27 +426,37 @@ func Preheat(gcodePath string, cfg *PreheatConfig) error {
 
 				state.State.Update(g)
 			}
-			g.PrintTime = state.PrintTime
 
 			// toolchange code has fixed time
 			_, tcCode := state.Extruders[g.Op]
 			if tcCode {
 				g.ToolchangeCode = tcCode
-				g.Time = cfg.ToolChangeTime
+				if cfg.Costs != nil {
+					g.Time = cfg.Costs.Toolchange
+				}
 			}
 		}
 
-		state.Gcodes = append(state.Gcodes, g)
-		state.GcodesTime += g.Time
-		state.PrintTime += g.Time
+		// this is essential
+		// by trying to encode each gcode with the print time
+		// we establish an order of gcodes which we could compare
+		// if a gcode is within a certain time of the head of the queue
+		g.PrintTime = state.PrintTime
+		state.Gcodes.Push(g)
+		if g.Time > 0 {
+			state.GcodesTime += g.Time
+			state.PrintTime += g.Time
+		}
 
 		// update tracking state
 		if g.Parsed {
-
+			// for none toolchange codes, it triggers a queue maintenance phase
 			if !g.ToolchangeCode {
 				// see if we to expire an entry
-				shouldDump := func() bool {
-					if (state.GcodesTime - state.Gcodes[0].Time) > state.MaxHeatUp {
+				shouldFlush := func() bool {
+					// if we have long enough gcodes in the queue
+					frontG := state.Gcodes.Front()
+					if (state.GcodesTime - frontG.Time) > state.MaxHeatUp {
 						return true
 					}
 					if state.ToolchangeCount == 0 {
@@ -395,19 +464,19 @@ func Preheat(gcodePath string, cfg *PreheatConfig) error {
 					}
 					return false
 				}
-				for len(state.Gcodes) > 1 && shouldDump() {
+				for state.Gcodes.Len() > 1 && shouldFlush() {
 					var (
-						g         = state.Gcodes[0]
+						frontCode = state.Gcodes.Front()
 						timestamp string
 					)
 
 					if cfg.timestamp && g.IsMove() {
-						timestamp = fmt.Sprintf("  ; printTime=%.2f", state.Gcodes[0].PrintTime)
+						timestamp = fmt.Sprintf("  ; printTime=%.2f", frontCode.PrintTime)
 					}
 					outputFp.WriteString(g.Line + timestamp + "\n")
 
-					state.GcodesTime -= g.Time
-					state.Gcodes = state.Gcodes[1:]
+					state.GcodesTime -= frontCode.Time
+					state.Gcodes.Pop()
 				}
 				continue
 			}
@@ -416,8 +485,8 @@ func Preheat(gcodePath string, cfg *PreheatConfig) error {
 			extruder := state.Extruders[g.Op]
 			if state.ToolchangeCount > 0 { // avoid inserting active gcode at the start of the file
 				// we have a tool change, we insert an tool active gcode at current queue head
-				headGcode := state.Gcodes[0]
-				preheatGcode := fmt.Sprintf("; PREHEAT %s %.1fs early @ %.2f\n%s\n", extruder.Name, state.GcodesTime, headGcode.PrintTime, extruder.ActiveGcode)
+				frontCode := state.Gcodes.Front()
+				preheatGcode := fmt.Sprintf("; PREHEAT %s %.1fs early @ %.2f\n%s\n", extruder.Name, state.GcodesTime, frontCode.PrintTime, extruder.ActiveGcode)
 				outputFp.WriteString(preheatGcode)
 			}
 			state.ToolchangeCount++
@@ -425,7 +494,8 @@ func Preheat(gcodePath string, cfg *PreheatConfig) error {
 	}
 
 	// write out remaining gcodes
-	for _, g := range state.Gcodes {
+	for state.Gcodes.Len() > 0 {
+		g := state.Gcodes.Pop()
 		outputFp.WriteString(g.Line + "\n")
 	}
 
