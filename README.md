@@ -1,5 +1,7 @@
 # GCODE Post Processor
 
+[中文](README_zh_CN.md)
+
 This is a post processor tool for 3D print slicers.
 
 ## Features

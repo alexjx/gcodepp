@@ -190,6 +190,11 @@ func (g *Gcode) Distance(cur *ExtruderState) float64 {
 	return 0.0
 }
 
+func (g *Gcode) IsToolchange(state *PreheatState) bool {
+	_, ok := state.Extruders[g.Op]
+	return ok
+}
+
 func ParseGcode(line string, lineNo int64) (g *Gcode) {
 	g = &Gcode{Line: line, LineNo: lineNo}
 
@@ -496,46 +501,6 @@ func Preheat(gcodePath string, cfg *PreheatConfig) error {
 		lineNo++
 
 		g := ParseGcode(line, lineNo)
-		if g.Parsed {
-			if g.Op == "M82" {
-				state.State.RelExtr = false
-			} else if g.Op == "M83" {
-				state.State.RelExtr = true
-			} else if g.Op == "G90" {
-				state.State.RelPos = false
-			} else if g.Op == "G91" {
-				state.State.RelPos = true
-			} else if g.Op == "G10" || g.Op == "G11" {
-				if cfg.Costs != nil {
-					g.Time = cfg.Costs.Retraction
-				}
-			} else if g.IsMove() {
-				// calculate time for move gcodes
-				d := g.Distance(state.State)
-
-				// FIXME: this is not accurate
-				// we should consider the acceleration and deceleration time
-				// let's first be rough: 30% of the time is acceleration and deceleration
-				if g.F.Valid {
-					g.Time = d / g.F.Value
-					state.State.Feedrate = g.F.Value
-				} else if state.State.Feedrate > 0 {
-					g.Time = d / state.State.Feedrate
-				}
-				g.Time += g.Time * cfg.speedChangeRatio
-
-				state.State.Update(g)
-			}
-
-			// toolchange code has fixed time
-			_, tcCode := state.Extruders[g.Op]
-			if tcCode {
-				g.ToolchangeCode = tcCode
-				if cfg.Costs != nil {
-					g.Time = cfg.Costs.Toolchange
-				}
-			}
-		}
 
 		// this is essential:
 		// by trying to encode each gcode with the print time
@@ -543,73 +508,122 @@ func Preheat(gcodePath string, cfg *PreheatConfig) error {
 		// if a gcode is within a certain time of the head of the queue
 		g.PrintTime = state.PrintTime
 		state.Gcodes.Push(g)
+
+		if !g.Parsed {
+			continue
+		}
+
+		switch {
+		case g.Op == "M82":
+			state.State.RelExtr = false
+			logrus.Infof("change to absolute extruder mode")
+		case g.Op == "M83":
+			state.State.RelExtr = true
+			logrus.Infof("change to relative extruder mode")
+		case g.Op == "G90":
+			state.State.RelPos = false
+			logrus.Infof("change to absolute position mode")
+		case g.Op == "G91":
+			state.State.RelPos = true
+			logrus.Infof("change to relative position mode")
+		case g.Op == "G10" || g.Op == "G11":
+			if cfg.Costs != nil {
+				g.Time = cfg.Costs.Retraction
+			}
+		case g.IsMove():
+			// calculate time for move gcodes
+			d := g.Distance(state.State)
+
+			// FIXME: this is not accurate
+			// we should consider the acceleration and deceleration time
+			// let's first be rough: 30% of the time is acceleration and deceleration
+			if g.F.Valid {
+				g.Time = d / g.F.Value
+				state.State.Feedrate = g.F.Value
+			} else if state.State.Feedrate > 0 {
+				g.Time = d / state.State.Feedrate
+			}
+			g.Time += g.Time * cfg.speedChangeRatio
+
+			state.State.Update(g)
+		case g.IsToolchange(state):
+			g.ToolchangeCode = true
+			if cfg.Costs != nil {
+				g.Time = cfg.Costs.Toolchange
+			}
+		}
+
 		if g.Time > 0 {
 			state.GcodesTime += g.Time
 			state.PrintTime += g.Time
 		}
 
-		// update tracking state
-		if g.Parsed {
-			// for none toolchange codes, it triggers a queue maintenance phase
-			if !g.ToolchangeCode {
-				g.Extruder = state.Current
-				continue
-			}
-
-			// this is a toolchange code
-			// we need to do two things:
-			// 1. insert a preheat gcode at the head of the queue for this tool
-			// 2. consider if we need to deactivate the previous tool, at the tail of the queue
-			//    but this is not optimal. Since we might problem to deactivate a tool that is preheated earlier
-			//    ----pA-pB---pA--a-b-a
-			//                      ^ if we deactivated a here. the previous pA is useless
-			//    so we can deactivate a tool only if it is not preheated in the future queue...
-			extruder := state.Extruders[g.Op]
-			curExtr := state.Current
-			if state.ToolchangeCount > 0 { // avoid inserting active gcode at the start of the file
-				// we have a tool change, we insert an tool active gcode at current queue head
-				qHeadCode := state.Gcodes.Front()
-
-				// do not preheat the tool if it has not yet been deactivated
-				if extruder.preheatedTime < 0.0 || (extruder.deactivatedTime > 0.0 && extruder.preheatedTime < extruder.deactivatedTime) {
-					preheatGcode := fmt.Sprintf("; PREHEAT %s [%.1f -> %.1f] (last %.1f / deactive %.1f) \n%s\n",
-						extruder.Name, qHeadCode.PrintTime, g.PrintTime,
-						extruder.preheatedTime, extruder.deactivatedTime,
-						extruder.ActiveGcode,
-					)
-					outputFp.WriteString(preheatGcode)
-					extruder.preheatedTime = qHeadCode.PrintTime // this is the time when this extruder is preheated
-				} else {
-					logrus.Debugf("skip preheat for %s @ %.1f: [%.1f -> %.1f] / %.1f",
-						extruder.Name, g.PrintTime, extruder.preheatedTime, extruder.preheatedForTime, extruder.deactivatedTime)
-				}
-				extruder.preheatedForTime = g.PrintTime
-
-				// check if we should deactivate the current tool
-				// we should only deactivate if the current tool is not preheated
-				// NOTE: this is only queued, it might be cancelled when we flush the queue
-				if curExtr != nil && curExtr.DeactivateGcode != "" {
-					logrus.Debugf("queue deactivate %s @ %.1f", curExtr.Name, g.PrintTime)
-					deactivateGcode := fmt.Sprintf("; DEACTIVATE %s @ %.1f\n%s\n",
-						curExtr.Name, g.PrintTime, curExtr.DeactivateGcode)
-					// we need to enqueue this gcode
-					code := Gcode{
-						Line:           deactivateGcode,
-						LineNo:         g.LineNo, // duplicate line number
-						DeactivateCode: true,
-						Extruder:       curExtr,
-						PrintTime:      g.PrintTime,
-					}
-					state.Gcodes.Push(&code)
-				}
-			}
-
-			state.ToolchangeCount++
-			state.Current = extruder
-
-			g.Extruder = extruder
-			g.PrevExtr = curExtr
+		// for none toolchange codes, we are done
+		if !g.ToolchangeCode {
+			g.Extruder = state.Current
+			continue
 		}
+
+		// this is a toolchange code
+		// we need to do two things:
+		// 1. insert a preheat gcode at the head of the queue for this tool
+		// 2. consider if we need to deactivate the previous tool, at the tail of the queue
+		//    but this is not optimal. Since we might problem to deactivate a tool that is preheated earlier
+		//    ----pA-pB---pA--a-b-a
+		//                      ^ if we deactivated a here. the previous pA is useless
+		//    so we can deactivate a tool only if it is not preheated in the future queue...
+		extruder := state.Extruders[g.Op]
+		curExtr := state.Current
+		if state.ToolchangeCount > 0 { // avoid inserting active gcode at the start of the file
+			logrus.Debugf("toolchange %s -> %s @ %.1f", curExtr.Name, extruder.Name, g.PrintTime)
+
+			// we have a tool change, we insert an tool active gcode at current queue head
+			qHeadCode := state.Gcodes.Front()
+
+			// do not preheat the tool if it has not yet been deactivated
+			if extruder.preheatedTime < 0.0 || (extruder.deactivatedTime > 0.0 && extruder.preheatedTime < extruder.deactivatedTime) {
+				logrus.Debugf("preheat %s @ %.1f: [%.1f -> %.1f] / %.1f",
+					extruder.Name, g.PrintTime,
+					extruder.preheatedTime, extruder.preheatedForTime,
+					extruder.deactivatedTime,
+				)
+
+				preheatGcode := fmt.Sprintf("; PREHEAT %s [%.1f -> %.1f] (last %.1f / deactive %.1f) \n%s\n",
+					extruder.Name, qHeadCode.PrintTime, g.PrintTime,
+					extruder.preheatedTime, extruder.deactivatedTime,
+					extruder.ActiveGcode,
+				)
+				outputFp.WriteString(preheatGcode)
+				extruder.preheatedTime = qHeadCode.PrintTime // this is the time when this extruder is preheated
+			} else {
+				logrus.Debugf("skip preheat for %s @ %.1f: [%.1f -> %.1f] / %.1f",
+					extruder.Name, g.PrintTime, extruder.preheatedTime, extruder.preheatedForTime, extruder.deactivatedTime)
+			}
+			extruder.preheatedForTime = g.PrintTime
+
+			// check if we should deactivate the current tool
+			// we should only deactivate if the current tool is not preheated
+			// NOTE: this is only queued, it might be cancelled when we flush the queue
+			if curExtr != nil && curExtr.DeactivateGcode != "" {
+				logrus.Debugf("queue deactivate %s @ %.1f", curExtr.Name, g.PrintTime)
+				deactivateGcode := fmt.Sprintf("; DEACTIVATE %s @ %.1f\n%s\n",
+					curExtr.Name, g.PrintTime, curExtr.DeactivateGcode)
+				// we need to enqueue this gcode
+				code := Gcode{
+					Line:           deactivateGcode,
+					LineNo:         g.LineNo, // duplicate line number
+					DeactivateCode: true,
+					Extruder:       curExtr,
+					PrintTime:      g.PrintTime,
+				}
+				state.Gcodes.Push(&code)
+			}
+		}
+
+		state.ToolchangeCount++
+		state.Current = extruder
+		g.Extruder = extruder
+		g.PrevExtr = curExtr
 	}
 
 	// write out remaining gcodes
