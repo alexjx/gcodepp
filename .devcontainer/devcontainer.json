@@ -27,7 +27,11 @@
       "extensions": [
         "EditorConfig.EditorConfig",
         "aldijav.golangwithdidi",
-        "ms-vscode.makefile-tools"
+        "ms-vscode.makefile-tools",
+        "golang.go",
+        "defaltd.go-coverage-viewer",
+        "nhoizey.gremlins",
+        "redhat.vscode-yaml"
       ],
       "settings": {}
     }

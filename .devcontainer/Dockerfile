@@ -23,7 +23,7 @@ RUN if [ "$USERNAME" != "root" ]; then \
             /home/$USERNAME/.vscode-server-insiders \
             /home/$USERNAME/.cache \
             /home/$USERNAME/.local && \
-        echo "$USERNAME ALL=\(ALL\) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME && \
+        echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME && \
         chmod 0440 /etc/sudoers.d/$USERNAME || exit 1; \
     fi
 

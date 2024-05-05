@@ -604,7 +604,7 @@ func Preheat(gcodePath string, cfg *PreheatConfig) error {
 			// check if we should deactivate the current tool
 			// we should only deactivate if the current tool is not preheated
 			// NOTE: this is only queued, it might be cancelled when we flush the queue
-			if curExtr != nil && curExtr.DeactivateGcode != "" {
+			if curExtr != nil && curExtr.DeactivateGcode != "" && curExtr != extruder {
 				logrus.Debugf("queue deactivate %s @ %.1f", curExtr.Name, g.PrintTime)
 				deactivateGcode := fmt.Sprintf("; DEACTIVATE %s @ %.1f\n%s\n",
 					curExtr.Name, g.PrintTime, curExtr.DeactivateGcode)
