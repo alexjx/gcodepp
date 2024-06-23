@@ -148,15 +148,14 @@ func (g *Gcode) IsMove() bool {
 }
 
 func (g *Gcode) Distance(cur *ExtruderState) float64 {
-	switch g.Op {
-	case "G0", "G1":
-		var (
-			E float64
-			X float64
-			Y float64
-			Z float64
-		)
+	var (
+		E float64
+		X float64
+		Y float64
+		Z float64
+	)
 
+	calcTargetCoords := func() {
 		if g.E.Valid {
 			E = g.E.Value
 		}
@@ -182,9 +181,23 @@ func (g *Gcode) Distance(cur *ExtruderState) float64 {
 				Z -= cur.Z
 			}
 		}
+	}
+
+	switch g.Op {
+	case "G0", "G1":
+		calcTargetCoords()
 		return math.Sqrt(math.Pow(X, 2) + math.Pow(Y, 2) + math.Pow(Z, 2) + math.Pow(E, 2))
 	case "G2", "G3":
 		// arc fitting gcodes
+		calcTargetCoords()
+		if g.R.Valid {
+			// R form
+			// calculate the arc length from current position to the end position
+
+		} else {
+			// IJK form
+
+		}
 	}
 
 	return 0.0
@@ -193,6 +206,10 @@ func (g *Gcode) Distance(cur *ExtruderState) float64 {
 func (g *Gcode) IsToolchange(state *PreheatState) bool {
 	_, ok := state.Extruders[g.Op]
 	return ok
+}
+
+func (g *Gcode) HasParam() bool {
+	return g.X.Valid || g.Y.Valid || g.Z.Valid || g.E.Valid || g.I.Valid || g.J.Valid || g.K.Valid || g.F.Valid || g.S.Valid || g.P.Valid || g.R.Valid
 }
 
 func ParseGcode(line string, lineNo int64) (g *Gcode) {
@@ -507,6 +524,17 @@ func Preheat(gcodePath string, cfg *PreheatConfig) error {
 		// we establish an order of gcodes which we could compare
 		// if a gcode is within a certain time of the head of the queue
 		g.PrintTime = state.PrintTime
+
+		if g.Op == "M104" || g.Op == "M109" {
+			// we shouldn't have temperature change gcode in the print file
+			// but we will allow wait only command
+			if g.Op == "M109" && g.HasParam() {
+				logrus.Warnf("temperature change gcode with parameters: %s", g.Line)
+			}
+			continue
+		}
+
+		// enqueue gcode
 		state.Gcodes.Push(g)
 
 		if !g.Parsed {
